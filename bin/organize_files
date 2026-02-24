@@ -1,0 +1,258 @@
+#!/bin/zsh
+
+# =====================================
+# Filename Hierarchy Organizer
+# =====================================
+# Description:
+#   Organizes markdown files into <category>/<topic>/ folders based on
+#   filename parts that roughly follow:
+#   <category>.<topic>.<type>.<model>.md
+#
+# Behavior:
+#   - Best-effort parsing (category/topic only)
+#   - Missing/invalid segments fall back to "unknown"
+#   - Never overwrites existing files; adds _N suffix on collisions
+#   - Preserves original filename (except conflict suffixing)
+#
+# Usage:
+#   bin/organize_files [OPTIONS] [PATH]
+#
+# Options:
+#   -n   Dry-run (show actions without moving files)
+#   -h   Show help
+#
+# PATH:
+#   - Directory: process top-level *.md files in that directory
+#   - File: process that single markdown file
+#   - Omitted: process top-level *.md files in current directory
+# =====================================
+
+set -u
+
+DRY_RUN=false
+INPUT_PATH="."
+
+print_usage() {
+  cat <<'EOF'
+Usage: organize_files [OPTIONS] [PATH]
+
+Organize markdown files into: <category>/<topic>/<original_filename>
+
+Options:
+  -n   Dry-run (no file moves)
+  -h   Show this help message
+EOF
+}
+
+log_info() {
+  print -- "[INFO] $1"
+}
+
+log_warn() {
+  print -- "[WARN] $1"
+}
+
+log_error() {
+  print -- "[ERROR] $1" >&2
+}
+
+trim_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  print -r -- "$value"
+}
+
+normalize_segment() {
+  local raw="$1"
+  local value
+
+  value="$(trim_whitespace "$raw")"
+  value="$(print -r -- "$value" | tr '[:upper:]' '[:lower:]' | sed -E 's/[[:space:]]+/_/g; s/[^a-z0-9_-]+/_/g; s/_+/_/g; s/^_+//; s/_+$//')"
+
+  if [[ -z "$value" ]]; then
+    print -r -- "unknown"
+  else
+    print -r -- "$value"
+  fi
+}
+
+parse_category_topic() {
+  local filename="$1"
+  local name_no_ext="${filename%.md}"
+  local -a parts
+  local raw_category raw_topic category topic fallback_used
+
+  parts=("${(@s:.:)name_no_ext}")
+  raw_category="${parts[1]:-}"
+  raw_topic="${parts[2]:-}"
+
+  category="$(normalize_segment "$raw_category")"
+  topic="$(normalize_segment "$raw_topic")"
+  fallback_used="false"
+
+  if [[ -z "${raw_category//[[:space:]]/}" || -z "${raw_topic//[[:space:]]/}" ]]; then
+    fallback_used="true"
+  fi
+  if [[ "$category" == "unknown" || "$topic" == "unknown" ]]; then
+    fallback_used="true"
+  fi
+
+  print -r -- "${category}|${topic}|${fallback_used}"
+}
+
+resolve_unique_destination() {
+  local destination="$1"
+  local source_abs="$2"
+  local base ext dir candidate counter
+
+  if [[ ! -e "$destination" ]]; then
+    print -r -- "$destination|false"
+    return 0
+  fi
+
+  base="${destination:t:r}"
+  ext=".${destination:e}"
+  dir="${destination:h}"
+  counter=1
+
+  while true; do
+    candidate="${dir}/${base}_${counter}${ext}"
+    if [[ "$candidate:A" == "$source_abs:A" ]]; then
+      print -r -- "$candidate|false"
+      return 0
+    fi
+    if [[ ! -e "$candidate" ]]; then
+      print -r -- "$candidate|true"
+      return 0
+    fi
+    (( counter++ ))
+  done
+}
+
+while getopts ":nh" opt; do
+  case "$opt" in
+    n)
+      DRY_RUN=true
+      ;;
+    h)
+      print_usage
+      exit 0
+      ;;
+    \?)
+      log_error "Invalid option: -$OPTARG"
+      print_usage
+      exit 1
+      ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [[ $# -gt 0 ]]; then
+  INPUT_PATH="$1"
+fi
+
+if [[ ! -e "$INPUT_PATH" ]]; then
+  log_error "Path does not exist: $INPUT_PATH"
+  exit 1
+fi
+
+typeset -a files
+ROOT_DIR=""
+
+if [[ -d "$INPUT_PATH" ]]; then
+  ROOT_DIR="${INPUT_PATH:A}"
+  files=("$ROOT_DIR"/*.md(N))
+else
+  if [[ "${INPUT_PATH:e:l}" != "md" ]]; then
+    log_error "File must be markdown (.md): $INPUT_PATH"
+    exit 1
+  fi
+  files=("${INPUT_PATH:A}")
+  ROOT_DIR="${files[1]:h}"
+fi
+
+if (( ${#files[@]} == 0 )); then
+  log_info "No markdown files found to process."
+  exit 0
+fi
+
+log_info "Root directory: $ROOT_DIR"
+log_info "Files to process: ${#files[@]}"
+if [[ "$DRY_RUN" == "true" ]]; then
+  log_info "Dry-run mode enabled (no files will be moved)."
+fi
+
+integer moved_count=0
+integer skipped_count=0
+integer conflict_renamed_count=0
+integer fallback_count=0
+integer error_count=0
+
+for source in "${files[@]}"; do
+  source_abs="${source:A}"
+  filename="${source_abs:t}"
+
+  parsed="$(parse_category_topic "$filename")"
+  category="${parsed%%|*}"
+  rest="${parsed#*|}"
+  topic="${rest%%|*}"
+  fallback_used="${rest##*|}"
+
+  destination_dir="${ROOT_DIR}/${category}/${topic}"
+  destination_path="${destination_dir}/${filename}"
+
+  unique_result="$(resolve_unique_destination "$destination_path" "$source_abs")"
+  final_destination="${unique_result%%|*}"
+  renamed_due_conflict="${unique_result##*|}"
+
+  if [[ "$source_abs:A" == "$final_destination:A" ]]; then
+    print -- "[SKIPPED] $filename already in place"
+    (( skipped_count++ ))
+    continue
+  fi
+
+  if [[ "$fallback_used" == "true" ]]; then
+    print -- "[PARSE-FALLBACK] $filename -> ${category}/${topic}"
+    (( fallback_count++ ))
+  fi
+
+  if [[ "$renamed_due_conflict" == "true" ]]; then
+    print -- "[CONFLICT-RENAMED] ${final_destination:t}"
+    (( conflict_renamed_count++ ))
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    print -- "[MOVED] $filename -> ${final_destination#$ROOT_DIR/} (dry-run)"
+    (( moved_count++ ))
+    continue
+  fi
+
+  if ! mkdir -p -- "$destination_dir"; then
+    log_error "Failed to create directory: $destination_dir"
+    (( error_count++ ))
+    continue
+  fi
+
+  if mv -- "$source_abs" "$final_destination"; then
+    print -- "[MOVED] $filename -> ${final_destination#$ROOT_DIR/}"
+    (( moved_count++ ))
+  else
+    log_error "Failed to move: $filename"
+    (( error_count++ ))
+  fi
+done
+
+print -- ""
+print -- "Summary:"
+print -- "  moved: ${moved_count}"
+print -- "  skipped: ${skipped_count}"
+print -- "  conflicted-renamed: ${conflict_renamed_count}"
+print -- "  parse-fallback-used: ${fallback_count}"
+print -- "  errors: ${error_count}"
+
+if (( error_count > 0 )); then
+  exit 1
+fi
+
+exit 0
